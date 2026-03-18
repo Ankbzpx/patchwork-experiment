@@ -131,17 +131,11 @@ def fit_patchwork(
         loss_reg = w_reg * jnp.square(double_well_potential(pred_occs)).mean()
 
         loss_prune = (
-            w_prune
-            * (
-                jnp.abs(s1_surf).mean()
-                + jnp.abs(s2_surf).mean()
-                + jnp.abs(s1).mean()
-                + jnp.abs(s2).mean()
-            )
-            + jax.nn.relu(1 - jnp.abs(ws1_surf)).mean()
-            + jax.nn.relu(1 - jnp.abs(ws2_surf)).mean()
-            + jax.nn.relu(1 - jnp.abs(ws1)).mean()
-            + jax.nn.relu(1 - jnp.abs(ws2)).mean()
+            w_prune * (s1_surf.mean() + s2_surf.mean() + s1.mean() + s2.mean())
+            + jax.nn.relu(1 - ws1_surf).mean()
+            + jax.nn.relu(1 - ws2_surf).mean()
+            + jax.nn.relu(1 - ws1).mean()
+            + jax.nn.relu(1 - ws2).mean()
         )
 
         # mse: Keep tessellation stiff
