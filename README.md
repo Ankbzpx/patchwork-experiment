@@ -1,5 +1,5 @@
 # Patchwork
-The implementation of preprint Patchwork: A compact representation for 3D polygonal shapes. Visual results are available at our [project page](https://ankbzpx.github.io/patchwork-page/).
+The implementation of preprint [Patchwork: A compact representation for 3D polygonal shapes](./preprint/preprint.pdf). Visual results are available at our [project page](https://ankbzpx.github.io/patchwork-page/).
 
 ## Environment Setup
 ```
