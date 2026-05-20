@@ -313,6 +313,7 @@ if __name__ == "__main__":
     parser.add_argument("--model_name", type=str, help="Model name")
     parser.add_argument("--exp_dir", type=str, help="Exp folder")
     parser.add_argument("--N", type=int, default=16384, help="Input point cloud size")
+    parser.add_argument("--rho", type=int, default=200, help="Rho for geo init")
     parser.add_argument("--w_mse", type=float, default=1.0, help="Weight mse")
     parser.add_argument("--w_normal", type=float, default=1.0, help="Weight normal")
     parser.add_argument("--w_reg", type=float, default=1.0, help="Weight reg")
@@ -322,6 +323,7 @@ if __name__ == "__main__":
         action="store_true",
         help="Cheap normal approximation with pass through, half the training cost.",
     )
+    parser.add_argument("--lr", type=float, default=1e-3, help="Learning rate")
     parser.add_argument("--n_steps", type=int, default=10000, help="Num of iterations")
     parser.add_argument("--batch_size", type=int, default=16384, help="Batch size")
     parser.add_argument("--res", type=int, default=256, help="MC res")
@@ -333,6 +335,8 @@ if __name__ == "__main__":
     model_name = args.model_name
     tag = f"{model_name}"
     N = args.N
+    rho = args.rho
+    lr = args.lr
     w_mse = args.w_mse
     w_normal = args.w_normal
     w_reg = args.w_reg
@@ -354,6 +358,7 @@ if __name__ == "__main__":
     softplus_thr = -4.6
 
     cfg = PatchworkConfig(
+        rho=rho,
         w_mse=w_mse,
         w_normal=w_normal,
         w_reg=w_reg,
@@ -394,7 +399,7 @@ if __name__ == "__main__":
         output_dir=os.path.join(exp_dir, model_name),
         per_device_train_batch_size=1,
         max_steps=n_steps,
-        learning_rate=1e-3,
+        learning_rate=lr,
         remove_unused_columns=False,
         lr_scheduler_type="constant_with_warmup",
         warmup_steps=n_steps // 10,
