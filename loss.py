@@ -5,12 +5,17 @@ os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "0"
 
 from functools import partial
 
-from triton_kernel import eval_grad_logsumexp_triton, eval_sum_exp_triton
+from triton_kernel import eval_grad_logsumexp_s_triton, eval_sum_exp_s_triton
 
 import jax
 from jax import grad, jit, numpy as jnp, vmap
 from jaxtyping import Array, Float, Int
 from torch2jax import torch2jax
+
+
+@jit
+def normalize(x):
+    return x / (jnp.linalg.norm(x) + 1e-8)
 
 
 @jit
@@ -34,7 +39,7 @@ def eikonal(x, norm=1):
 # Note that we normalize the range by \frac{1}{\beta}, so the backward pass is exactly the softmax (with temperature)
 def logsumexp_init(N: Int, M: Int, D: Int):
     sum_exp_jax = torch2jax(
-        eval_sum_exp_triton,
+        eval_sum_exp_s_triton,
         jax.ShapeDtypeStruct((M, D + 1), jnp.float32),
         jax.ShapeDtypeStruct((N, D + 1), jnp.float32),
         jax.ShapeDtypeStruct((N,), jnp.float32),
@@ -42,13 +47,15 @@ def logsumexp_init(N: Int, M: Int, D: Int):
         output_shapes=(
             jax.ShapeDtypeStruct((M,), jnp.float32),
             jax.ShapeDtypeStruct((M,), jnp.float32),
+            jax.ShapeDtypeStruct((M,), jnp.float32),
+            jax.ShapeDtypeStruct((M,), jnp.int32),
             jax.ShapeDtypeStruct((M,), jnp.int32),
             jax.ShapeDtypeStruct((M,), jnp.float32),
         ),
     )
 
     eval_grad_logsumexp_jax = torch2jax(
-        eval_grad_logsumexp_triton,
+        eval_grad_logsumexp_s_triton,
         jax.ShapeDtypeStruct((N, D + 1), jnp.float32),
         jax.ShapeDtypeStruct((N,), jnp.float32),
         jax.ShapeDtypeStruct((1,), jnp.float32),
@@ -66,8 +73,8 @@ def logsumexp_init(N: Int, M: Int, D: Int):
 
     @jit
     def logsumexp_impl(X: Array, A: Array, s: Array, beta: Array):
-        z_max, ws, z_max_idx, sum_exp = sum_exp_jax(X, A, s, beta)
-        primal = (jnp.log(sum_exp) + z_max) / beta, ws, z_max_idx
+        z_max, _, ws, z_max_idx, z_second_max_idx, sum_exp = sum_exp_jax(X, A, s, beta)
+        primal = (jnp.log(sum_exp) + z_max) / beta, ws, z_max_idx, z_second_max_idx
         res = X, A, s, beta, z_max, sum_exp
         return primal, res
 
@@ -83,7 +90,7 @@ def logsumexp_init(N: Int, M: Int, D: Int):
     @jit
     def logsumexp_bwd(res, grad_out):
         X, A, s, beta, z_max, sum_exp = res
-        dz, ds, _ = grad_out
+        dz, ds, _, _ = grad_out
         grad_A, grad_s, grad_beta = eval_grad_logsumexp_jax(
             A, s, beta, z_max, sum_exp, dz, ds, X
         )
@@ -134,7 +141,7 @@ if __name__ == "__main__":
     def test_loss(X, A, c, s, beta):
         X = jnp.hstack([X, jnp.ones((len(X), 1))])
         A = jnp.hstack([A, c[:, None]])
-        val, ws, idx = logsumexp(X, A, s, beta)
+        val, ws, idx, second_idx = logsumexp(X, A, s, beta)
         return jnp.mean(val) + jnp.sum(ws)
 
     grad_A = grad(test_loss, argnums=1)(X, A, c, s, beta)

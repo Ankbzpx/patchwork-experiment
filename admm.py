@@ -1,6 +1,5 @@
 import os
 
-
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "0"
 
 import jax
@@ -184,21 +183,22 @@ def fit_admm(
     return primal
 
 
-# Rasterize with kernel, bypass the uniform buffer restriction
 @wp.kernel
-def rasterize_patchwork(
+def rasterize_patchwork_kernel(
     A: wp.array(dtype=wp.vec3f),
     s: wp.array(dtype=wp.float32),
-    img: wp.array2d(dtype=wp.float32),
+    img: wp.array2d(dtype=wp.vec3f),
     H: int,
     W: int,
+    bound: float,
     line_width: float,
+    level_set: bool,
 ):
     idx_i, idx_j = wp.tid()
 
     uv = wp.vec3(
-        2.0 * (wp.float32(idx_i) / wp.float32(H) - 0.5),
-        2.0 * (wp.float32(idx_j) / wp.float32(W) - 0.5),
+        bound * (wp.float32(idx_i) / wp.float32(H) - 0.5),
+        bound * (wp.float32(idx_j) / wp.float32(W) - 0.5),
         1.0,
     )
 
@@ -211,7 +211,7 @@ def rasterize_patchwork(
 
     num_lines = A.shape[0]
     for i in range(num_lines):
-        val = wp.dot(A[i], uv)
+        val = wp.dot(A[i], uv) + wp.log(wp.abs(s[i]))
         if s[i] > 0:
             if max_val_pos < val:
                 max_val_pos = val
@@ -228,14 +228,46 @@ def rasterize_patchwork(
             second_max_val = val
             second_max_idx = i
 
+    # This unsigned minimal power distance to either pos/neg sites are continuous
+    field_val = max_val
+
     coeff = A[max_idx] - A[second_max_idx]
     line_scale = wp.length(wp.vec2(coeff[0], coeff[1]))
     if abs(max_val - second_max_val) / line_scale < 0.01 * line_width:
-        img[idx_i, idx_j] = 1.0
-    elif max_val_pos - max_val_neg < 0:
-        img[idx_i, idx_j] = 0.5
+        if s[max_idx] * s[second_max_idx] < 0:
+            img[idx_i, idx_j] = wp.vec3(0.94902, 0.55686, 0.16863)
+        else:
+            img[idx_i, idx_j] = wp.vec3(0.90196, 0.90196, 0.90196)
     else:
-        img[idx_i, idx_j] = 0.0
+        if max_val_pos - max_val_neg < 0:
+            img[idx_i, idx_j] = wp.vec3(0.50980, 0.73333, 0.89020)
+        else:
+            img[idx_i, idx_j] = wp.vec3(0.0, 0.18039, 0.29804)
+
+    if level_set:
+        img[idx_i, idx_j] *= 1.0 - wp.exp(-1000.0 * wp.abs(field_val))
+        img[idx_i, idx_j] *= 0.8 + 0.2 * wp.cos(200.0 * field_val)
+
+
+def rasterize_patchwork(A, s, res=1024, line_scale=0.5, bound=2.0, level_set=False):
+    A = jnp.asarray(A)
+    s = jnp.asarray(s)
+    img = wp.zeros((res, res), dtype=wp.vec3)
+    wp.launch(
+        kernel=rasterize_patchwork_kernel,
+        dim=(res, res),
+        inputs=(
+            wp.from_jax(A, dtype=wp.vec3),
+            wp.from_jax(s, dtype=wp.float32),
+            img,
+            res,
+            res,
+            bound,
+            line_scale,
+            level_set,
+        ),
+    )
+    return wp.to_jax(img)
 
 
 if __name__ == "__main__":
@@ -244,7 +276,7 @@ if __name__ == "__main__":
     grid_res_train = 32
     axis = jnp.linspace(-1, 1, grid_res_train)
     X = jnp.stack(jnp.meshgrid(axis, axis), axis=-1).reshape(-1, 2)
-    y = vmap(koch_2)(X)
+    y = vmap(two_stars)(X)
 
     primal = fit_admm(X, y)
     a = primal["a"]
@@ -257,22 +289,6 @@ if __name__ == "__main__":
     A = jnp.vstack([jnp.hstack([a, c[:, None]]), jnp.hstack([b, d[:, None]])])
     s = jnp.concat([jnp.ones_like(y), -jnp.ones_like(y)])
 
-    res = 1024
-    img = wp.zeros((res, res), dtype=wp.float32)
-
-    wp.launch(
-        kernel=rasterize_patchwork,
-        dim=(res, res),
-        inputs=(
-            wp.from_jax(A, dtype=wp.vec3),
-            wp.from_jax(s, dtype=wp.float32),
-            img,
-            res,
-            res,
-            0.5,
-        ),
-    )
-
     fig = plt.figure(figsize=(10, 10))
-    plt.imshow(wp.to_jax(img))
+    plt.imshow(rasterize_patchwork(A, s))
     plt.show()

@@ -1,6 +1,6 @@
 from functools import partial
 
-from common import normalize
+from loss import normalize
 
 import jax
 from jax import jit, numpy as jnp, vmap
@@ -49,11 +49,9 @@ def sample_edge(V_edge, n):
 
 def sample_edge_uniform(V, E, n):
     per_edge_verts = V[E]
-    V_up = vmap(sample_edge, in_axes=(0, None))(per_edge_verts, n)
-    V_up = jnp.permute_dims(V_up, (1, 0, 2)).reshape(-1, 2)
+    V_up = vmap(sample_edge, in_axes=(0, None))(per_edge_verts, n).reshape(-1, 2)
     V_n = vmap(edge_normal)(per_edge_verts)
-    V_up_n = jnp.repeat(V_n[:, None, :], n, axis=1)
-    V_up_n = jnp.permute_dims(V_up_n, (1, 0, 2)).reshape(-1, 2)
+    V_up_n = jnp.repeat(V_n[:, None, :], n, axis=1).reshape(-1, 2)
     V_up_n = vmap(normalize)(V_up_n)
     return V_up, V_up_n
 
@@ -66,10 +64,10 @@ def sample_edge_interval(V_edge, key, n):
     return v0 * (1 - t) + v1 * t
 
 
-def sample_edge_random(V, E, n, seed=0):
+def sample_edge_random(V, E, n, key=jax.random.PRNGKey(0)):
     per_edge_verts = V[E]
     N = len(per_edge_verts)
-    keys = jax.random.split(jax.random.PRNGKey(seed), N)
+    keys = jax.random.split(key, N)
     V_up = vmap(sample_edge_interval, in_axes=(0, 0, None))(
         per_edge_verts, keys, n
     ).reshape(-1, 2)
@@ -77,3 +75,29 @@ def sample_edge_random(V, E, n, seed=0):
     V_up_n = jnp.repeat(V_n[:, None, :], n, axis=1).reshape(-1, 2)
     V_up_n = vmap(normalize)(V_up_n)
     return V_up, V_up_n
+
+
+def read_obj(path):
+    r"""
+    Load obj, assume same face size. Support quad mesh, vertex color, polygon_groups
+    """
+    vertices = []
+    edges = []
+
+    with open(path, "r", encoding="utf-8") as f:
+        file_lines = f.readlines()
+        for i in range(len(file_lines)):
+            line = file_lines[i]
+            data = line.split()
+            if len(data) == 0:
+                continue
+            if data[0] == "v":
+                vertices.append(np.float64(data[1:4]))
+            elif data[0] == "l":
+                data = [da.split("/") for da in data[1:]]
+                edges.append([int(d[0]) for d in data])
+
+    vertices = np.stack(vertices).reshape(-1, 3)
+    edges = np.int64(edges) - 1
+
+    return vertices, edges

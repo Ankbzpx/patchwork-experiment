@@ -1,7 +1,6 @@
-jax[cuda12]
+jax[cuda13]
 torch
 torchvision
-transformers[torch]
 scipy
 scikit-image
 equinox
@@ -15,4 +14,6 @@ icecream
 trimesh
 moderngl
 libigl
+tqdm
+opencv-python
 git+https://github.com/rdyro/torch2jax.git

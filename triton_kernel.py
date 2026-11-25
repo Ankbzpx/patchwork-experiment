@@ -1,6 +1,5 @@
 from typing import List
 
-from jaxtyping import Array, Float, Int
 import torch
 import triton
 import triton.language as tl
@@ -65,18 +64,400 @@ def get_cuda_autotune_config():
     )
 
 
+@triton.jit
+def sum_exp_kernel(
+    X_ptr,
+    A_ptr,
+    c_ptr,
+    s_ptr,
+    beta_ptr,
+    z_max_ptr,
+    ws_ptr,
+    z_max_idx_ptr,
+    sum_exp_ptr,
+    N,
+    M,
+    X_stride_n,
+    X_stride_d,
+    A_stride_m,
+    A_stride_d,
+    c_stride_m,
+    s_stride_m,
+    z_max_stride_n,
+    ws_stride_n,
+    z_max_idx_stride_n,
+    sum_exp_stride_n,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    beta = tl.load(beta_ptr)
+
+    # More L2 cache friendly launch (optional)
+    num_pid_n = tl.num_programs(axis=0)
+    num_pid_m = tl.num_programs(axis=1)
+    pid_n, pid_m = tl.swizzle2d(pid_n, pid_m, num_pid_n, num_pid_m, GROUP_SIZE)
+
+    base_n = pid_n * BLOCK_SIZE_N
+
+    # [BLOCK_SIZE_N]
+    batch_base_n = base_n + tl.arange(0, BLOCK_SIZE_N)
+    batch_n_mask = batch_base_n < N
+    X_i = tl.load(X_ptr + batch_base_n * X_stride_n, mask=batch_n_mask)
+    X_j = tl.load(X_ptr + batch_base_n * X_stride_n + X_stride_d, mask=batch_n_mask)
+    X_k = tl.load(X_ptr + batch_base_n * X_stride_n + 2 * X_stride_d, mask=batch_n_mask)
+
+    z_max = tl.full((BLOCK_SIZE_N,), -float("inf"), tl.float32)
+    ws = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    z_max_idx = tl.full((BLOCK_SIZE_N,), -1, tl.int32)
+    sum_exp = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    for base_m in tl.range(0, M, BLOCK_SIZE_M):
+        # [BLOCK_SIZE_M]
+        batch_base_m = base_m + tl.arange(0, BLOCK_SIZE_M)
+        batch_m_mask = batch_base_m < M
+        A_i = tl.load(A_ptr + batch_base_m * A_stride_m, mask=batch_m_mask)
+        A_j = tl.load(A_ptr + batch_base_m * A_stride_m + A_stride_d, mask=batch_m_mask)
+        A_k = tl.load(
+            A_ptr + batch_base_m * A_stride_m + 2 * A_stride_d, mask=batch_m_mask
+        )
+        c = tl.load(c_ptr + batch_base_m * c_stride_m, mask=batch_m_mask)
+        s = tl.load(s_ptr + batch_base_m * s_stride_m, mask=batch_m_mask)
+
+        # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+        dp1 = X_i[:, None] * A_i[None, :]
+        dp2 = X_j[:, None] * A_j[None, :]
+        dp3 = X_k[:, None] * A_k[None, :]
+        z = beta * (dp1 + dp2 + dp3 + c[None, :]) + tl.log(s)[None, :]
+        z = tl.where(batch_n_mask[:, None] & batch_m_mask[None, :], z, -float("inf"))
+
+        # [BLOCK_SIZE_N]
+        block_z_max, block_z_max_idx = tl.max(z, axis=1, return_indices=True)
+        block_z_max_idx += base_m
+        block_idx_mask = block_z_max > z_max
+        z_max_idx = tl.where(block_idx_mask, block_z_max_idx, z_max_idx)
+
+        # [BLOCK_SIZE_N]
+        block_sum_exp = tl.sum(tl.exp(z - block_z_max[:, None]), axis=1)
+        block_ws = tl.sum(tl.exp(z - block_z_max[:, None]) * s[None, :], axis=1)
+        new_z_max = tl.maximum(block_z_max, z_max)
+        sum_exp = (
+            tl.exp(block_z_max - new_z_max) * block_sum_exp
+            + tl.exp(z_max - new_z_max) * sum_exp
+        )
+        ws = tl.exp(block_z_max - new_z_max) * block_ws + tl.exp(z_max - new_z_max) * ws
+        z_max = new_z_max
+
+    tl.store(z_max_ptr + batch_base_n * z_max_stride_n, z_max, mask=batch_n_mask)
+    tl.store(ws_ptr + batch_base_n * ws_stride_n, ws / sum_exp, mask=batch_n_mask)
+    tl.store(
+        z_max_idx_ptr + batch_base_n * z_max_idx_stride_n, z_max_idx, mask=batch_n_mask
+    )
+    tl.store(sum_exp_ptr + batch_base_n * sum_exp_stride_n, sum_exp, mask=batch_n_mask)
+
+
+def eval_sum_exp_triton(
+    X: torch.Tensor,
+    A: torch.Tensor,
+    c: torch.Tensor,
+    s: torch.Tensor,
+    beta: torch.Tensor,
+    block_size_n: int = 16,
+    block_size_m: int = 512,
+):
+    assert A.shape[0] == c.shape[0], "Incompatible dimensions"
+    assert A.is_contiguous(), "Matrix A must be contiguous"
+    assert X.is_contiguous(), "Matrix samples must be contiguous"
+
+    N = X.shape[0]
+    M = A.shape[0]
+    z_max = torch.zeros((N,), device=X.device, dtype=X.dtype)
+    ws = torch.zeros((N,), device=X.device, dtype=X.dtype)
+    z_max_idx = torch.zeros((N,), device=X.device, dtype=torch.int32)
+    sum_exp = torch.zeros((N,), device=X.device, dtype=X.dtype)
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE_N"]), 1)
+
+    configs = {
+        "BLOCK_SIZE_N": block_size_n,
+        "BLOCK_SIZE_M": block_size_m,
+        "GROUP_SIZE": 16,
+        "num_warps": 2,
+        "num_stages": 3,
+    }
+
+    sum_exp_kernel[grid](
+        X,
+        A,
+        c,
+        s,
+        beta,
+        z_max,
+        ws,
+        z_max_idx,
+        sum_exp,
+        N,
+        M,
+        X.stride(0),
+        X.stride(1),
+        A.stride(0),
+        A.stride(1),
+        c.stride(0),
+        s.stride(0),
+        z_max.stride(0),
+        ws.stride(0),
+        z_max_idx.stride(0),
+        sum_exp.stride(0),
+        **configs,
+    )
+    return z_max, ws, z_max_idx, sum_exp
+
+
+@triton.jit
+def grad_logsumexp_kernel(
+    A_ptr,
+    c_ptr,
+    s_ptr,
+    beta_ptr,
+    X_ptr,
+    z_max_ptr,
+    sum_exp_ptr,
+    dz_ptr,
+    ds_ptr,
+    grad_A_ptr,
+    grad_c_ptr,
+    grad_s_ptr,
+    grad_beta_ptr,
+    N,
+    M,
+    A_stride_n,
+    A_stride_d,
+    c_stride_n,
+    s_stride_n,
+    X_stride_m,
+    X_stride_d,
+    z_max_stride_m,
+    sum_exp_stride_m,
+    dz_stride_m,
+    ds_stride_m,
+    grad_A_stride_n,
+    grad_A_stride_d,
+    grad_c_stride_n,
+    grad_s_stride_n,
+    BLOCK_SIZE_N: tl.constexpr,
+    BLOCK_SIZE_M: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+):
+    pid_n = tl.program_id(axis=0)
+    pid_m = tl.program_id(axis=1)
+
+    beta = tl.load(beta_ptr)
+
+    # More L2 cache friendly launch (optional)
+    num_pid_n = tl.num_programs(axis=0)
+    num_pid_m = tl.num_programs(axis=1)
+    pid_n, pid_m = tl.swizzle2d(pid_n, pid_m, num_pid_n, num_pid_m, GROUP_SIZE)
+
+    base_n = pid_n * BLOCK_SIZE_N
+
+    # [BLOCK_SIZE_N]
+    batch_base_n = base_n + tl.arange(0, BLOCK_SIZE_N)
+    batch_n_mask = batch_base_n < N
+
+    A_i = tl.load(A_ptr + batch_base_n * A_stride_n, mask=batch_n_mask)
+    A_j = tl.load(A_ptr + batch_base_n * A_stride_n + A_stride_d, mask=batch_n_mask)
+    A_k = tl.load(A_ptr + batch_base_n * A_stride_n + 2 * A_stride_d, mask=batch_n_mask)
+    c = tl.load(c_ptr + batch_base_n * c_stride_n, mask=batch_n_mask)
+    s = tl.load(s_ptr + batch_base_n * s_stride_n, mask=batch_n_mask)
+
+    grad_A_i = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    grad_A_j = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    grad_A_k = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    grad_c = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    grad_s = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
+    grad_beta = tl.full((), 0.0, tl.float32)
+    for base_m in tl.range(0, M, BLOCK_SIZE_M):
+        # [BLOCK_SIZE_M]
+        batch_base_m = base_m + tl.arange(0, BLOCK_SIZE_M)
+        batch_m_mask = batch_base_m < M
+
+        X_i = tl.load(X_ptr + batch_base_m * X_stride_m, mask=batch_m_mask)
+        X_j = tl.load(X_ptr + batch_base_m * X_stride_m + X_stride_d, mask=batch_m_mask)
+        X_k = tl.load(
+            X_ptr + batch_base_m * X_stride_m + 2 * X_stride_d, mask=batch_m_mask
+        )
+        z_max = tl.load(z_max_ptr + batch_base_m * z_max_stride_m, mask=batch_m_mask)
+        sum_exp = tl.load(
+            sum_exp_ptr + batch_base_m * sum_exp_stride_m, mask=batch_m_mask
+        )
+        dz = tl.load(dz_ptr + batch_base_m * dz_stride_m, mask=batch_m_mask)
+        ds = tl.load(ds_ptr + batch_base_m * ds_stride_m, mask=batch_m_mask)
+
+        # [BLOCK_SIZE_N, BLOCK_SIZE_M]
+        dp1 = A_i[:, None] * X_i[None, :]
+        dp2 = A_j[:, None] * X_j[None, :]
+        dp3 = A_k[:, None] * X_k[None, :]
+        logit = dp1 + dp2 + dp3 + c[:, None]
+        z = beta * logit + tl.log(s)[:, None] - z_max[None, :]
+        p = tl.exp(z) / sum_exp[None, :] * dz[None, :]
+        p = tl.where(batch_n_mask[:, None] & batch_m_mask[None, :], p, 0)
+
+        grad_A_i += tl.sum(p * X_i[None, :], axis=1)
+        grad_A_j += tl.sum(p * X_j[None, :], axis=1)
+        grad_A_k += tl.sum(p * X_k[None, :], axis=1)
+        grad_c += tl.sum(p, axis=1)
+        grad_s += tl.sum(p / beta / s[:, None], axis=1)
+
+        grad_s += tl.sum(
+            tl.where(
+                batch_n_mask[:, None] & batch_m_mask[None, :],
+                tl.exp(z) / sum_exp[None, :] * ds[None, :],
+                0,
+            ),
+            axis=1,
+        )
+
+        # Product rule
+        grad_beta += tl.sum(
+            tl.where(
+                batch_n_mask[:, None] & batch_m_mask[None, :],
+                p
+                * (logit / beta - ((tl.log(sum_exp) + z_max) / (beta * beta))[None, :]),
+                0,
+            )
+        )
+
+    tl.store(grad_A_ptr + batch_base_n * grad_A_stride_n, grad_A_i, mask=batch_n_mask)
+    tl.store(
+        grad_A_ptr + batch_base_n * grad_A_stride_n + grad_A_stride_d,
+        grad_A_j,
+        mask=batch_n_mask,
+    )
+    tl.store(
+        grad_A_ptr + batch_base_n * grad_A_stride_n + 2 * grad_A_stride_d,
+        grad_A_k,
+        mask=batch_n_mask,
+    )
+    tl.store(grad_c_ptr + batch_base_n * grad_c_stride_n, grad_c, mask=batch_n_mask)
+    tl.store(grad_s_ptr + batch_base_n * grad_s_stride_n, grad_s, mask=batch_n_mask)
+    tl.store(grad_beta_ptr + pid_n, grad_beta)
+
+
+def eval_grad_logsumexp_triton(
+    A: torch.Tensor,
+    c: torch.Tensor,
+    s: torch.Tensor,
+    beta: torch.Tensor,
+    zmax: torch.Tensor,
+    sum_exp: torch.Tensor,
+    dz: torch.Tensor,
+    ds: torch.Tensor,
+    X: torch.Tensor,
+    block_size_n: int = 16,
+    block_size_m: int = 512,
+):
+    assert A.shape[0] == c.shape[0], "Incompatible dimensions"
+    assert A.is_contiguous(), "Matrix A must be contiguous"
+    assert X.is_contiguous(), "Matrix samples must be contiguous"
+
+    N = A.shape[0]
+    M = X.shape[0]
+    grad_A = torch.zeros_like(A)
+    grad_c = torch.zeros_like(c)
+    grad_s = torch.zeros_like(s)
+    grad_beta = torch.zeros((triton.cdiv(N, block_size_n),), device=beta.device)
+
+    grid = lambda META: (triton.cdiv(N, META["BLOCK_SIZE_N"]), 1)
+
+    configs = {
+        "BLOCK_SIZE_N": block_size_n,
+        "BLOCK_SIZE_M": block_size_m,
+        "GROUP_SIZE": 16,
+        "num_warps": 2,
+        "num_stages": 3,
+    }
+
+    grad_logsumexp_kernel[grid](
+        A,
+        c,
+        s,
+        beta,
+        X,
+        zmax,
+        sum_exp,
+        dz,
+        ds,
+        grad_A,
+        grad_c,
+        grad_s,
+        grad_beta,
+        N,
+        M,
+        A.stride(0),
+        A.stride(1),
+        c.stride(0),
+        s.stride(0),
+        X.stride(0),
+        X.stride(1),
+        zmax.stride(0),
+        sum_exp.stride(0),
+        dz.stride(0),
+        ds.stride(0),
+        grad_A.stride(0),
+        grad_A.stride(1),
+        grad_c.stride(0),
+        grad_s.stride(0),
+        **configs,
+    )
+    return grad_A, grad_c, grad_s, grad_beta.sum()[None]
+
+
+@torch.library.custom_op("patchwork::logsumexp", mutates_args=())
+def logsumexp(
+    X: torch.Tensor,
+    A: torch.Tensor,
+    c: torch.Tensor,
+    s: torch.Tensor,
+    beta: torch.Tensor,
+) -> List[torch.Tensor]:
+    z_max, ws, z_max_idx, sum_exp = eval_sum_exp_triton(X, A, c, s, beta)
+    return (torch.log(sum_exp) + z_max) / beta, z_max, ws, z_max_idx, sum_exp
+
+
+def logsumexp_setup_context(ctx, inputs, output):
+    X, A, c, s, beta = inputs
+    _, z_max, _, _, sum_exp = output
+    ctx.save_for_backward(X, A, c, s, beta, z_max, sum_exp)
+
+
+def logsumexp_backward(ctx, grad_out):
+    X, A, c, s, beta, z_max, sum_exp = ctx.saved_tensors
+    dz, _, ds, _, _ = grad_out
+    grad_A, grad_c, grad_s, grad_beta = eval_grad_logsumexp_triton(
+        A, c, s, beta, z_max, sum_exp, dz, ds, X
+    )
+    return None, grad_A, grad_c, grad_s, grad_beta
+
+
+logsumexp.register_autograd(logsumexp_backward, setup_context=logsumexp_setup_context)
+
+
 # @triton.autotune(
 #     configs=get_cuda_autotune_config(),
 #     key=["N", "M"],
 # )
 @triton.jit
-def sum_exp_kernel(
+def sum_exp_s_kernel(
     X_ptr,
     A_ptr,
     s_ptr,
     beta_ptr,
     z_max_ptr,
+    z_second_max_ptr,
     z_max_idx_ptr,
+    z_second_max_idx_ptr,
     sum_exp_ptr,
     ws_ptr,
     N,
@@ -88,7 +469,9 @@ def sum_exp_kernel(
     A_stride_d,
     s_stride_m,
     z_max_stride_n,
+    z_second_max_stride_n,
     z_max_idx_stride_n,
+    z_second_max_idx_stride_n,
     sum_exp_stride_n,
     ws_stride_n,
     BLOCK_SIZE_N: tl.constexpr,
@@ -114,6 +497,7 @@ def sum_exp_kernel(
     batch_base_d = tl.arange(0, 16)
     batch_d_mask = batch_base_d < D
 
+    # [BLOCK_SIZE_N, 16]
     X = tl.load(
         X_ptr
         + (batch_base_n[:, None] * X_stride_n)
@@ -129,7 +513,9 @@ def sum_exp_kernel(
         )
 
     z_max = tl.full((BLOCK_SIZE_N,), -float("inf"), tl.float32)
+    z_second_max = tl.full((BLOCK_SIZE_N,), -float("inf"), tl.float32)
     z_max_idx = tl.full((BLOCK_SIZE_N,), -1, tl.int32)
+    z_second_max_idx = tl.full((BLOCK_SIZE_N,), -1, tl.int32)
     sum_exp = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
     ws = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
 
@@ -137,6 +523,7 @@ def sum_exp_kernel(
         batch_base_m = base_m + tl.arange(0, BLOCK_SIZE_M)
         batch_m_mask = batch_base_m < M
 
+        # [BLOCK_SIZE_M, 16]
         A = tl.load(
             A_ptr
             + (batch_base_m[:, None] * A_stride_m)
@@ -148,17 +535,48 @@ def sum_exp_kernel(
             A = tl.inline_asm_elementwise(
                 ASM, "=r, r", [A], dtype=tl.float32, is_pure=True, pack=1
             )
+        # [BLOCK_SIZE_M]
         s = tl.load(s_ptr + batch_base_m * s_stride_m, mask=batch_m_mask)
 
+        # [BLOCK_SIZE_N, BLOCK_SIZE_M]
         dp = tl.dot(X, A.T, input_precision="tf32" if use_tf32 else "ieee")
         z = beta * dp + tl.log(s)[None, :]
         z = tl.where(batch_n_mask[:, None] & batch_m_mask[None, :], z, -float("inf"))
 
+        # [BLOCK_SIZE_N]
         block_z_max, block_z_max_idx = tl.max(z, axis=1, return_indices=True)
+
+        # Overwrite max to compute the second max
+        z2 = tl.where(
+            tl.arange(0, BLOCK_SIZE_M)[None, :] == block_z_max_idx[:, None],
+            -float("inf"),
+            z,
+        )
+        block_z_second_max, block_z_second_max_idx = tl.max(
+            z2, axis=1, return_indices=True
+        )
+
         block_z_max_idx += base_m
+        block_z_second_max_idx += base_m
+
         block_max_mask = block_z_max > z_max
         new_z_max = tl.where(block_max_mask, block_z_max, z_max)
         new_z_max_idx = tl.where(block_max_mask, block_z_max_idx, z_max_idx)
+
+        # If block_z_max > z_max, either z_max or block_z_second_max
+        #   (z_max is strictly better than z_second_max)
+        candidate1_mask = z_max > block_z_second_max
+        candidate1 = tl.where(candidate1_mask, z_max, block_z_second_max)
+        candidate1_idx = tl.where(candidate1_mask, z_max_idx, block_z_second_max_idx)
+
+        # If z_max > block_z_max, either block_z_max or z_second_max
+        #   (block_z_max is strictly better than block_z_second_max)
+        candidate2_mask = block_z_max > z_second_max
+        candidate2 = tl.where(candidate2_mask, block_z_max, z_second_max)
+        candidate2_idx = tl.where(candidate2_mask, block_z_max_idx, z_second_max_idx)
+
+        z_second_max = tl.where(block_max_mask, candidate1, candidate2)
+        z_second_max_idx = tl.where(block_max_mask, candidate1_idx, candidate2_idx)
 
         block_sum_exp = tl.sum(tl.exp(z - block_z_max[:, None]), axis=1)
         block_ws = tl.sum(tl.exp(z - block_z_max[:, None]) * s[None, :], axis=1)
@@ -172,19 +590,29 @@ def sum_exp_kernel(
 
     tl.store(z_max_ptr + batch_base_n * z_max_stride_n, z_max, mask=batch_n_mask)
     tl.store(
+        z_second_max_ptr + batch_base_n * z_second_max_stride_n,
+        z_second_max,
+        mask=batch_n_mask,
+    )
+    tl.store(
         z_max_idx_ptr + batch_base_n * z_max_idx_stride_n, z_max_idx, mask=batch_n_mask
+    )
+    tl.store(
+        z_second_max_idx_ptr + batch_base_n * z_second_max_idx_stride_n,
+        z_second_max_idx,
+        mask=batch_n_mask,
     )
     tl.store(sum_exp_ptr + batch_base_n * sum_exp_stride_n, sum_exp, mask=batch_n_mask)
     tl.store(ws_ptr + batch_base_n * ws_stride_n, ws / sum_exp, mask=batch_n_mask)
 
 
-def eval_sum_exp_triton(
-    X: Array,
-    A: Array,
-    s: Array,
-    beta: Array,
-    block_size_n: Int = 64,
-    block_size_m: Int = 64,
+def eval_sum_exp_s_triton(
+    X: torch.Tensor,
+    A: torch.Tensor,
+    s: torch.Tensor,
+    beta: torch.Tensor,
+    block_size_n: int = 64,
+    block_size_m: int = 64,
     use_tf32: bool = False,
 ):
     assert A.is_contiguous(), "Matrix A must be contiguous"
@@ -193,7 +621,9 @@ def eval_sum_exp_triton(
     N, D = X.shape
     M = A.shape[0]
     z_max = torch.zeros((N,), device=X.device, dtype=X.dtype)
+    z_second_max = torch.zeros((N,), device=X.device, dtype=X.dtype)
     z_max_idx = torch.zeros((N,), device=X.device, dtype=torch.int32)
+    z_second_max_idx = torch.zeros((N,), device=X.device, dtype=torch.int32)
     sum_exp = torch.zeros((N,), device=X.device, dtype=X.dtype)
     ws = torch.zeros((N,), device=X.device, dtype=X.dtype)
 
@@ -208,13 +638,15 @@ def eval_sum_exp_triton(
         "use_tf32": use_tf32,
     }
 
-    sum_exp_kernel[grid](
+    sum_exp_s_kernel[grid](
         X,
         A,
         s,
         beta,
         z_max,
+        z_second_max,
         z_max_idx,
+        z_second_max_idx,
         sum_exp,
         ws,
         N,
@@ -226,12 +658,14 @@ def eval_sum_exp_triton(
         A.stride(1),
         s.stride(0),
         z_max.stride(0),
+        z_second_max.stride(0),
         z_max_idx.stride(0),
+        z_second_max_idx.stride(0),
         sum_exp.stride(0),
         ws.stride(0),
         **configs,
     )
-    return z_max, ws, z_max_idx, sum_exp
+    return z_max, z_second_max, ws, z_max_idx, z_second_max_idx, sum_exp
 
 
 # @triton.autotune(
@@ -239,7 +673,7 @@ def eval_sum_exp_triton(
 #     key=["N", "M"],
 # )
 @triton.jit
-def grad_logsumexp_kernel(
+def grad_logsumexp_s_kernel(
     A_ptr,
     s_ptr,
     beta_ptr,
@@ -289,6 +723,7 @@ def grad_logsumexp_kernel(
     batch_base_d = tl.arange(0, 16)
     batch_d_mask = batch_base_d < D
 
+    # [BLOCK_SIZE_N, 16]
     A = tl.load(
         A_ptr
         + (batch_base_n[:, None] * A_stride_n)
@@ -301,15 +736,18 @@ def grad_logsumexp_kernel(
         A = tl.inline_asm_elementwise(
             ASM, "=r, r", [A], dtype=tl.float32, is_pure=True, pack=1
         )
+    # [BLOCK_SIZE_N]
     s = tl.load(s_ptr + batch_base_n * s_stride_n, mask=batch_n_mask)
 
     grad_A = tl.full((BLOCK_SIZE_N, 16), 0, tl.float32)
     grad_s = tl.full((BLOCK_SIZE_N,), 0, tl.float32)
     grad_beta = tl.full((), 0.0, tl.float32)
     for base_m in tl.range(0, M, BLOCK_SIZE_M):
+        # [BLOCK_SIZE_M]
         batch_base_m = base_m + tl.arange(0, BLOCK_SIZE_M)
         batch_m_mask = batch_base_m < M
 
+        # [BLOCK_SIZE_M, 16]
         X = tl.load(
             X_ptr
             + (batch_base_m[:, None] * X_stride_m)
@@ -321,6 +759,7 @@ def grad_logsumexp_kernel(
             X = tl.inline_asm_elementwise(
                 ASM, "=r, r", [X], dtype=tl.float32, is_pure=True, pack=1
             )
+        # [BLOCK_SIZE_M]
         z_max = tl.load(z_max_ptr + batch_base_m * z_max_stride_m, mask=batch_m_mask)
         sum_exp = tl.load(
             sum_exp_ptr + batch_base_m * sum_exp_stride_m, mask=batch_m_mask
@@ -328,6 +767,7 @@ def grad_logsumexp_kernel(
         dz = tl.load(dz_ptr + batch_base_m * dz_stride_m, mask=batch_m_mask)
         ds = tl.load(ds_ptr + batch_base_m * ds_stride_m, mask=batch_m_mask)
 
+        # [BLOCK_SIZE_N, BLOCK_SIZE_M]
         dp = tl.dot(A, X.T, input_precision="tf32" if use_tf32 else "ieee")
         z = beta * dp + tl.log(s)[:, None] - z_max[None, :]
         p = tl.exp(z) / sum_exp[None, :] * dz[None, :]
@@ -369,17 +809,17 @@ def grad_logsumexp_kernel(
     tl.store(grad_beta_ptr + pid_n, grad_beta)
 
 
-def eval_grad_logsumexp_triton(
-    A: Array,
-    s: Array,
-    beta: Array,
-    zmax: Array,
-    sum_exp: Array,
-    dz: Array,
-    ds: Array,
-    X: Array,
-    block_size_n: Int = 64,
-    block_size_m: Int = 64,
+def eval_grad_logsumexp_s_triton(
+    A: torch.Tensor,
+    s: torch.Tensor,
+    beta: torch.Tensor,
+    zmax: torch.Tensor,
+    sum_exp: torch.Tensor,
+    dz: torch.Tensor,
+    ds: torch.Tensor,
+    X: torch.Tensor,
+    block_size_n: int = 64,
+    block_size_m: int = 64,
     use_tf32: bool = False,
 ):
     assert A.is_contiguous(), "Matrix A must be contiguous"
@@ -403,7 +843,7 @@ def eval_grad_logsumexp_triton(
         "use_tf32": use_tf32,
     }
 
-    grad_logsumexp_kernel[grid](
+    grad_logsumexp_s_kernel[grid](
         A,
         s,
         beta,
@@ -446,7 +886,11 @@ def eval_LSE_naive(X, A, c, s, beta):
     logits = (
         beta * (torch.einsum("nd,md->nm", A, X) + c[:, None]) + torch.log(s)[:, None]
     )
-    logits_max, max_idx = torch.max(logits, dim=0)
+    top, top_indices = torch.topk(logits, k=2, dim=0)
+    z_max = top[0]
+    z_second_max = top[1]
+    max_idx = top_indices[0]
+    second_max_idx = top_indices[1]
     ws = (torch.softmax(logits, dim=0).detach() * s[:, None]).sum(0)
     return (
         (
@@ -459,7 +903,21 @@ def eval_LSE_naive(X, A, c, s, beta):
             / beta
         ),
         ws,
+        z_max,
+        z_second_max,
         max_idx.int(),
+        second_max_idx.int(),
+    )
+
+
+def eval_LSE_torch(X, A, c, s, beta):
+    return (
+        torch.logsumexp(
+            beta * (torch.einsum("nd,md->nm", A, X) + c[:, None])
+            + torch.log(s)[:, None],
+            dim=0,
+        )
+        / beta
     )
 
 
@@ -468,41 +926,48 @@ def eval_LSE_triton(X, A, c, s, beta):
     return (torch.log(sum_exp) + z_max) / beta, z_max_idx
 
 
-@torch.library.custom_op("patchwork::logsumexp", mutates_args=())
-def logsumexp(
+@torch.library.custom_op("patchwork::logsumexp_s", mutates_args=())
+def logsumexp_s(
     X: torch.Tensor,
     A: torch.Tensor,
     s: torch.Tensor,
     beta: torch.Tensor,
 ) -> List[torch.Tensor]:
-    z_max, ws, z_max_idx, sum_exp = eval_sum_exp_triton(X, A, s, beta)
+    z_max, z_second_max, ws, z_max_idx, z_second_max_idx, sum_exp = (
+        eval_sum_exp_s_triton(X, A, s, beta)
+    )
     return (
         (torch.log(sum_exp) + z_max) / beta,
         z_max,
+        z_second_max,
         ws,
         z_max_idx,
+        z_second_max_idx,
         sum_exp,
     )
 
 
-def logsumexp_setup_context(ctx, inputs, output):
+def logsumexp_s_setup_context(ctx, inputs, output):
     X, A, s, beta = inputs
-    _, z_max, _, _, sum_exp = output
+    _, z_max, _, _, _, _, sum_exp = output
     ctx.save_for_backward(X, A, s, beta, z_max, sum_exp)
 
 
-def logsumexp_backward(ctx, grad_out):
+def logsumexp_s_backward(ctx, grad_out):
     X, A, s, beta, z_max, sum_exp = ctx.saved_tensors
-    dz, _, ds, _, _ = grad_out
-    grad_A, grad_s, grad_beta = eval_grad_logsumexp_triton(
+    dz, _, _, ds, _, _, _ = grad_out
+    grad_A, grad_s, grad_beta = eval_grad_logsumexp_s_triton(
         A, s, beta, z_max, sum_exp, dz, ds, X
     )
     return None, grad_A, grad_s, grad_beta
 
 
-logsumexp.register_autograd(logsumexp_backward, setup_context=logsumexp_setup_context)
+logsumexp_s.register_autograd(
+    logsumexp_s_backward, setup_context=logsumexp_s_setup_context
+)
 
-if __name__ == "__main__":
+
+def test_LSE():
     torch.random.manual_seed(0)
 
     N = 16384
@@ -513,10 +978,30 @@ if __name__ == "__main__":
     c = torch.rand((M,)).cuda().requires_grad_(True)
     beta = torch.rand((1,)).cuda().requires_grad_(True)
 
+    _, _, z_max, z_second_max, z_max_idx, z_second_max_idx = eval_LSE_naive(
+        X, A, c, s, beta
+    )
+    z_max1, z_second_max1, ws1, z_max_idx1, z_second_max_idx1, sum_exp1 = (
+        eval_sum_exp_s_triton(
+            torch.hstack([X, torch.ones((len(X), 1), dtype=X.dtype, device=X.device)]),
+            torch.hstack([A, c[:, None]]),
+            s,
+            beta,
+            use_tf32=False,
+        )
+    )
+
+    print(
+        torch.allclose(z_max, z_max1),
+        torch.allclose(z_second_max, z_second_max1),
+        torch.allclose(z_max_idx, z_max_idx1),
+        torch.allclose(z_second_max_idx, z_second_max_idx1),
+    )
+
     def test_loss_triton(X, A, c, s, beta):
         A = torch.hstack([A, c[:, None]])
         X = torch.hstack([X, torch.ones((len(X), 1), dtype=X.dtype, device=X.device)])
-        val, _, ws, _, _ = logsumexp(X, A, s, beta)
+        val, _, _, ws, _, _, _ = logsumexp_s(X, A, s, beta)
         return val.sum() + ws.sum()
 
     loss_triton = test_loss_triton(X, A, c, s, beta)
@@ -526,7 +1011,7 @@ if __name__ == "__main__":
     d_beta_triton = gradient(loss_triton, beta)
 
     def test_loss_torch(X, A, c, s, beta):
-        val, ws, _ = eval_LSE_naive(X, A, c, s, beta)
+        val, ws = eval_LSE_naive(X, A, c, s, beta)[:2]
         return val.sum() + ws.sum()
 
     loss_torch = test_loss_torch(X, A, c, s, beta)
@@ -541,8 +1026,22 @@ if __name__ == "__main__":
     ic(d_s_triton[:10], d_s_torch[:10])
 
     print(
-        torch.allclose(d_A_triton, d_A_torch),
-        torch.allclose(d_c_triton, d_c_torch),
+        torch.allclose(d_A_triton, d_A_torch, rtol=1e-4, atol=1e-5),
+        torch.allclose(d_c_triton, d_c_torch, rtol=1e-4, atol=1e-5),
         torch.allclose(d_s_triton, d_s_torch),
         torch.allclose(d_beta_triton, d_beta_torch),
     )
+
+    lse_naive, ws, _, _, max_idx_naive, _ = eval_LSE_naive(X, A, c, s, beta)
+    lse_torch = eval_LSE_torch(X, A, c, s, beta)
+    lse_triton, max_idx_triton = eval_LSE_triton(X, A, c, s, beta)
+
+    print(
+        torch.allclose(lse_torch, lse_naive),
+        torch.allclose(lse_torch, lse_triton),
+        torch.allclose(max_idx_naive, max_idx_triton),
+    )
+
+
+if __name__ == "__main__":
+    test_LSE()
