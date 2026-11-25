@@ -32,7 +32,7 @@ python extract.py --model_name smooth/bunny --exp_dir exp --vis
 ```
 
 ## Data & Checkpoints
-The datasets and checkpoints are available at [HuggingFace](https://huggingface.co/datasets/Ankbzpx/patchwork). For evaluation, download the datasets and place them in the root folder of this repository, then running the following commands as instructed.
+The datasets and checkpoints are available at [HuggingFace](https://huggingface.co/datasets/Ankbzpx/patchwork). The teaser figure meshes are available in the [GeomDist](https://github.com/1zb/GeomDist) repository. For evaluation, download the datasets and place them in the root folder of this repository, then running the following commands as instructed.
 
 > **IMPORTANT** Each dataset is subject to its own license. In particular, data derived from [ShapeNet](https://huggingface.co/ShapeNet) may only be used for non-commercial research and educational purposes, under the [ShapeNet Terms of Use](https://huggingface.co/spaces/ShapeNet/README/blob/main/TERMS.md).
 
