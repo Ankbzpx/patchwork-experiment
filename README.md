@@ -1,5 +1,5 @@
 # Patchwork
-The implementation of preprint [Patchwork: A Polyhedral Implicit Representation for Highly Detailed 3D Shapes](https://arxiv.org/abs/2605.16266). More visual results are available at our [project page](https://ankbzpx.github.io/patchwork-page/).
+The implementation of preprint [Patchwork: A Polyhedral Implicit Representation for Highly Detailed 3D Shapes](./preprint/preprint.pdf). More visual results are available at our [project page](https://ankbzpx.github.io/patchwork-page/).
 
 <img src="./teaser/teaser.jpg" width="100%" />
 
