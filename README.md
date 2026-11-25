@@ -21,7 +21,13 @@ python playground.py
 </details>
 
 ## Testing
-For testing, run
+### 2D interactive demo
+```
+python fit_geo_2d.py --model_name among_us --exp_dir exp
+```
+
+### 3D shape fitting
+Run
 
 ```
 python fit_geo_3d.py --model_name smooth/bunny --exp_dir exp --res 512 --vis
